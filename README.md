@@ -1,3 +1,6 @@
+
+<div align="center">
+
 # 🎯 Recognition Faciale
 
 > Détection et reconnaissance faciale en temps réel sur flux vidéo, avec interface HUD flottante et personnalisable.
@@ -7,6 +10,8 @@
 [![No Cloud](https://img.shields.io/badge/No%20Cloud-100%25%20Offline-critical?style=for-the-badge&logo=cloud-off)](https://github.com/gunout/recognition-faciale)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+
+</div>
 
 ---
 
@@ -103,9 +108,12 @@ Les paramètres sont ajustables en haut du fichier `recognition.py` :
 MIT License. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
 
 ---
-
+<div align="center">
 ## 🔗 Liens utiles
 
 - [face_recognition (GitHub)](https://github.com/ageitgey/face_recognition)
 - [OpenCV](https://opencv.org/)
 - [Shields.io - Badges](https://shields.io/)
+
+</div>
+
