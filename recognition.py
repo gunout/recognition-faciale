@@ -6,21 +6,32 @@ import os
 import mss
 import time
 import threading
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+import pickle
+import faiss
+from PIL import Image, ImageTk
 from queue import Queue
+from datetime import datetime
+
+# ⚠️ Désactiver le multithreading interne d'OpenCV (évite les crashs)
+cv2.setNumThreads(0)
 
 # ============================================================
 # 1. CONFIGURATION GÉNÉRALE
 # ============================================================
 KNOWN_FACES_DIR = "known_faces"
-TOLERANCE = 0.6
+SNAPSHOT_DIR = "snapshots_inconnus"
+INDEX_FILE = "faiss_index.index"
+NAMES_FILE = "faiss_names.pkl"
 
-# ⚠️ Zone de capture de la vidéo sur votre écran
+# Seuil de tolérance FAISS (distance L2 au carré).
+# Pour face_recognition, une tolérance de 0.6 correspond environ à une distance L2 de 0.36.
+TOLERANCE = 0.45 
+
 MONITOR_REGION = {"top": 100, "left": 300, "width": 1000, "height": 600}
 
 HUD_CONFIG = {
-    "width": 600,
-    "height": 360,
+    "width": 700,
+    "height": 420,
     "top": 50,
     "left": 50
 }
@@ -31,50 +42,125 @@ HUD_CONFIG = {
 DETECTION_MODEL = "hog"
 UPSAMPLE = 1
 ANALYSIS_SCALE = 0.5
-DETECTION_INTERVAL = 4
+DETECTION_INTERVAL = 3
 MAX_FPS = 30
+SNAPSHOT_COOLDOWN = 30
 
 # ============================================================
-# 3. COULEURS DU THÈME MILITAIRE
+# 3. COULEURS MILITAIRES
 # ============================================================
-COLOR_TARGET = (0, 255, 0)      # Vert néon
-COLOR_UNKNOWN = (0, 0, 255)     # Rouge
-COLOR_BG = (0, 0, 0)            # Noir
-COLOR_HUD = (0, 200, 0)         # Vert sombre pour l'interface
+COLOR_TARGET = (0, 255, 0)      # Vert néon (reconnu)
+COLOR_UNKNOWN = (0, 0, 255)     # Rouge (inconnu)
+COLOR_HUD = (0, 180, 0)         # Vert sombre (interface)
 
 # ============================================================
-# 4. CHARGEMENT DES VISAGES
+# 4. VERROU GLOBAL POUR FACE_RECOGNITION (ANTI-CRASH)
 # ============================================================
-def load_known_faces():
-    known_encodings = []
-    known_names = []
-    if not os.path.exists(KNOWN_FACES_DIR):
-        print(f"[ERREUR] Le dossier '{KNOWN_FACES_DIR}' n'existe pas.")
-        return known_encodings, known_names
-
-    for filename in os.listdir(KNOWN_FACES_DIR):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            filepath = os.path.join(KNOWN_FACES_DIR, filename)
-            image = face_recognition.load_image_file(filepath)
-            encodings = face_recognition.face_encodings(image)
-            if len(encodings) > 0:
-                for encoding in encodings:
-                    known_encodings.append(encoding)
-                    base_name = os.path.splitext(filename)[0].split('_')[0]
-                    known_names.append(base_name)
-                print(f"[INFO] Visage chargé : {filename}")
-            else:
-                print(f"[ATTENTION] Aucun visage dans {filename}")
-    return known_encodings, known_names
+face_lock = threading.Lock()
 
 # ============================================================
-# 5. CLASSE HUD MILITAIRE
+# 5. GESTIONNAIRE FAISS (HOT RELOAD SÉCURISÉ)
+# ============================================================
+class FaceDatabase:
+    def __init__(self):
+        self.index = None
+        self.names = []
+        self.lock = threading.Lock()
+        self.running = True
+        self.last_mtime = 0
+
+    def load_index(self):
+        """Charge l'index FAISS et les noms depuis le disque."""
+        if os.path.exists(INDEX_FILE) and os.path.exists(NAMES_FILE):
+            self.index = faiss.read_index(INDEX_FILE)
+            with open(NAMES_FILE, 'rb') as f:
+                self.names = pickle.load(f)
+            print(f"[DB] ✅ Index FAISS chargé : {self.index.ntotal} visages.")
+        else:
+            print("[DB] ⚠️ Index non trouvé. Création d'un index vide.")
+            self.index = None
+            self.names = []
+
+    def add_face(self, encoding, name):
+        """Ajoute un nouveau visage à l'index et sauvegarde."""
+        with self.lock:
+            if self.index is None:
+                self.index = faiss.IndexFlatL2(encoding.shape[0])
+            
+            # Ajout à l'index
+            self.index.add(np.array([encoding]).astype('float32'))
+            self.names.append(name)
+            
+            # Sauvegarde
+            faiss.write_index(self.index, INDEX_FILE)
+            with open(NAMES_FILE, 'wb') as f:
+                pickle.dump(self.names, f)
+            
+            print(f"[HOT RELOAD] ✅ Visage ajouté : {name} (total: {self.index.ntotal})")
+
+    def start_watcher(self):
+        thread = threading.Thread(target=self._watch_loop, daemon=True)
+        thread.start()
+        print("[DB] Hot-reload activé (surveillance de known_faces/).")
+
+    def _watch_loop(self):
+        while self.running:
+            time.sleep(3) # Vérifie toutes les 3 secondes
+            self.reload_if_needed()
+
+    def reload_if_needed(self):
+        """Détecte les nouveaux fichiers et les ajoute à l'index."""
+        if not os.path.exists(KNOWN_FACES_DIR):
+            return
+
+        current_mtime = os.path.getmtime(KNOWN_FACES_DIR)
+        if current_mtime <= self.last_mtime:
+            return
+        self.last_mtime = current_mtime
+
+        files = [f for f in os.listdir(KNOWN_FACES_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        existing_bases = set(self.names)
+        
+        for filename in files:
+            base_name = os.path.splitext(filename)[0].split('_')[0]
+            if base_name not in existing_bases:
+                filepath = os.path.join(KNOWN_FACES_DIR, filename)
+                print(f"[HOT RELOAD] Nouveau visage détecté : {filename}")
+                try:
+                    # ⬇️ VERROU : empêche dlib de planter
+                    with face_lock:
+                        image = face_recognition.load_image_file(filepath)
+                        encs = face_recognition.face_encodings(image)
+                    if len(encs) > 0:
+                        self.add_face(encs[0], base_name)
+                except Exception as e:
+                    print(f"[HOT RELOAD] ⚠️ Erreur sur {filename} : {e}")
+
+    def search(self, encoding):
+        """Recherche les visages les plus proches dans l'index."""
+        with self.lock:
+            if self.index is None or self.index.ntotal == 0:
+                return [], []
+            
+            query = np.array([encoding]).astype('float32')
+            distances, indices = self.index.search(query, k=3) # Top 3
+            
+            valid_distances = []
+            valid_names = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx < len(self.names) and idx >= 0:
+                    valid_distances.append(dist)
+                    valid_names.append(self.names[idx])
+            
+            return valid_distances, valid_names
+
+# ============================================================
+# 6. CLASSE HUD MILITAIRE (FUSIONNÉE)
 # ============================================================
 class MilitaryHUD:
-    def __init__(self, root, known_encodings, known_names):
+    def __init__(self, root, face_db):
         self.root = root
-        self.known_encodings = known_encodings
-        self.known_names = known_names
+        self.face_db = face_db
         self.running = True
         
         self._drag_data = {"x": 0, "y": 0}
@@ -82,12 +168,13 @@ class MilitaryHUD:
         
         self.frame_queue = Queue(maxsize=2)
         self.latest_detections = []
-        self.scan_line_y = 0
+        self.last_snapshot = {}
         
-        # Fenêtre
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
-        self.root.attributes('-alpha', 0.85)  # Semi-transparent
+        self.root.attributes('-alpha', 0.90)
         self.root.configure(bg='black')
         
         self.hud_width = HUD_CONFIG['width']
@@ -98,19 +185,19 @@ class MilitaryHUD:
         
         self.update_geometry(HUD_CONFIG['left'], HUD_CONFIG['top'])
         
-        # Événements souris
         self.canvas.bind("<ButtonPress-1>", self.start_move)
         self.canvas.bind("<B1-Motion>", self.do_move)
         self.canvas.bind("<MouseWheel>", self.do_zoom)
         self.canvas.bind("<Button-4>", self.do_zoom)
         self.canvas.bind("<Button-5>", self.do_zoom)
         
-        # Lancer les threads
+        print("[HUD] Démarrage des threads...")
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.capture_thread.start()
         self.detection_thread.start()
         
+        print("[HUD] Démarrage de la boucle d'affichage...")
         self.display_loop()
 
     def update_geometry(self, x, y):
@@ -129,12 +216,11 @@ class MilitaryHUD:
         self.root.geometry(f"+{x}+{y}")
 
     def do_zoom(self, event):
-        if self._resizing:
-            return
+        if self._resizing: return
         self._resizing = True
         scale = 1.1 if (event.num == 4 or event.delta > 0) else 0.9
-        self.hud_width = max(150, int(self.hud_width * scale))
-        self.hud_height = max(90, int(self.hud_height * scale))
+        self.hud_width = max(200, int(self.hud_width * scale))
+        self.hud_height = max(120, int(self.hud_height * scale))
         self.update_geometry(self.root.winfo_x(), self.root.winfo_y())
         self.canvas.delete("all")
         self._resizing = False
@@ -147,14 +233,37 @@ class MilitaryHUD:
                     frame = np.array(screenshot)[:, :, :3].copy()
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                     if self.frame_queue.full():
-                        try:
-                            self.frame_queue.get_nowait()
-                        except:
-                            pass
+                        try: self.frame_queue.get_nowait()
+                        except: pass
                     self.frame_queue.put(frame)
                 except Exception as e:
                     print(f"[ERREUR capture] {e}")
                 time.sleep(1 / MAX_FPS)
+
+    def save_unknown_snapshot(self, frame, top, right, bottom, left, face_idx):
+        """Sauvegarde une capture UNIQUEMENT pour les visages inconnus."""
+        now = time.time()
+        signature = f"unk_{int(left/100)}_{int(top/100)}"
+        
+        if signature in self.last_snapshot:
+            if now - self.last_snapshot[signature] < SNAPSHOT_COOLDOWN:
+                return
+        self.last_snapshot[signature] = now
+        
+        margin = 40
+        h, w = frame.shape[:2]
+        y1, y2 = max(0, top - margin), min(h, bottom + margin)
+        x1, x2 = max(0, left - margin), min(w, right + margin)
+        
+        face_img = frame[y1:y2, x1:x2]
+        if face_img.size == 0: return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"INCONNU_{timestamp}_{face_idx}.jpg"
+        filepath = os.path.join(SNAPSHOT_DIR, filename)
+        
+        cv2.imwrite(filepath, face_img)
+        print(f"[SNAPSHOT INCONNU] ✅ {filepath}")
 
     def detection_loop(self):
         frame_counter = 0
@@ -168,52 +277,52 @@ class MilitaryHUD:
             if frame_counter % DETECTION_INTERVAL != 0:
                 continue
             
-            if ANALYSIS_SCALE != 1.0:
-                analyzed = cv2.resize(frame, (0, 0), fx=ANALYSIS_SCALE, fy=ANALYSIS_SCALE)
-            else:
-                analyzed = frame
-            
+            analyzed = cv2.resize(frame, (0, 0), fx=ANALYSIS_SCALE, fy=ANALYSIS_SCALE) if ANALYSIS_SCALE != 1.0 else frame
             rgb_analyzed = cv2.cvtColor(analyzed, cv2.COLOR_BGR2RGB)
             
-            face_locations = face_recognition.face_locations(
-                rgb_analyzed,
-                number_of_times_to_upsample=UPSAMPLE,
-                model=DETECTION_MODEL
-            )
-            face_encodings = face_recognition.face_encodings(rgb_analyzed, face_locations)
+            # ⬇️ VERROU : empêche dlib de planter pendant la détection
+            with face_lock:
+                face_locations = face_recognition.face_locations(
+                    rgb_analyzed, number_of_times_to_upsample=UPSAMPLE, model=DETECTION_MODEL
+                )
+                face_encodings = face_recognition.face_encodings(rgb_analyzed, face_locations)
             
             detections = []
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
-                if len(face_distances) > 0:
-                    best_match_index = np.argmin(face_distances)
-                    best_distance = face_distances[best_match_index]
-                    if best_distance < TOLERANCE:
-                        name = self.known_names[best_match_index].upper()
+            for idx, ((top, right, bottom, left), face_encoding) in enumerate(zip(face_locations, face_encodings)):
+                # ⬇️ RECHERCHE FAISS
+                distances, names = self.face_db.search(face_encoding)
+                
+                name = "INCONNU"
+                color = COLOR_UNKNOWN
+                best_dist = 1.0
+                
+                if len(distances) > 0:
+                    best_dist = distances[0]
+                    if best_dist < TOLERANCE:
+                        name = names[0].upper()
                         color = COLOR_TARGET
                     else:
-                        name = "INCONNU"
-                        color = COLOR_UNKNOWN
-                else:
-                    name = "INCONNU"
-                    color = COLOR_UNKNOWN
+                        # Snapshot pour inconnu
+                        inv = 1.0 / ANALYSIS_SCALE
+                        threading.Thread(
+                            target=self.save_unknown_snapshot,
+                            args=(frame.copy(), int(top*inv), int(right*inv), int(bottom*inv), int(left*inv), idx+1),
+                            daemon=True
+                        ).start()
                 
                 inv = 1.0 / ANALYSIS_SCALE
+                target_id = f"T-{idx+1:02d}"
                 detections.append((
-                    int(top * inv), int(right * inv),
-                    int(bottom * inv), int(left * inv),
-                    name, color
+                    int(top * inv), int(right * inv), int(bottom * inv), int(left * inv),
+                    name, color, target_id, best_dist
                 ))
             
             self.latest_detections = detections
 
-    def draw_military_box(self, img, left, top, right, bottom, color, name):
-        """Dessine un cadre de visée militaire (coins + réticule)."""
-        h, w = img.shape[:2]
+    def draw_military_box(self, img, left, top, right, bottom, color, name, target_id, distance):
         thickness = 2
-        corner_len = min(20, int((right - left) * 0.2))
+        corner_len = min(25, int((right - left) * 0.25))
         
-        # 4 coins
         cv2.line(img, (left, top), (left + corner_len, top), color, thickness)
         cv2.line(img, (left, top), (left, top + corner_len), color, thickness)
         cv2.line(img, (right, top), (right - corner_len, top), color, thickness)
@@ -223,57 +332,32 @@ class MilitaryHUD:
         cv2.line(img, (right, bottom), (right - corner_len, bottom), color, thickness)
         cv2.line(img, (right, bottom), (right, bottom - corner_len), color, thickness)
         
-        # Réticule central (croix)
-        cx = (left + right) // 2
-        cy = (top + bottom) // 2
-        cross = 8
-        cv2.line(img, (cx - cross, cy), (cx + cross, cy), color, 1)
-        cv2.line(img, (cx, cy - cross), (cx, cy + cross), color, 1)
+        cx, cy = (left + right) // 2, (top + bottom) // 2
+        cv2.line(img, (cx - 6, cy), (cx + 6, cy), color, 1)
+        cv2.line(img, (cx, cy - 6), (cx, cy + 6), color, 1)
         
-        # Texte avec ombre portée
-        text_pos = (left, top - 10)
-        if text_pos[1] < 15:
-            text_pos = (left, bottom + 20)
+        label = f"{target_id} | {name}"
+        text_y = top - 10 if top > 20 else bottom + 20
         
-        # Ombre
-        cv2.putText(img, name, (text_pos[0] + 1, text_pos[1] + 1), 
-                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-        # Texte
-        cv2.putText(img, name, text_pos, 
-                    cv2.FONT_HERSHEY_DUPLEX, 0.6, color, 1, cv2.LINE_AA)
-        
-        # Distance
-        dist_text = f"{name}"
-        cv2.putText(img, dist_text, (left, bottom + 15), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+        cv2.putText(img, label, (left + 1, text_y + 1), cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, label, (left, text_y), cv2.FONT_HERSHEY_DUPLEX, 0.45, color, 1, cv2.LINE_AA)
+        cv2.putText(img, f"DIST: {distance:.2f}", (left, bottom + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
     def draw_hud_overlay(self, img):
-        """Dessine les éléments fixes du HUD (barre de statut, scanline)."""
+        """Dessine les éléments fixes du HUD (barre de statut, bords) - SANS SCANLINE."""
         h, w = img.shape[:2]
+        cv2.rectangle(img, (0, 0), (w, 22), (0, 0, 0), -1)
+        cv2.putText(img, "SYS://SURVEILLANCE_MODE", (8, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_HUD, 1, cv2.LINE_AA)
         
-        # Barre de statut en haut
-        cv2.rectangle(img, (0, 0), (w, 25), (0, 0, 0), -1)
-        cv2.putText(img, "SYS://SURVEILLANCE_MODE", (10, 17), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_HUD, 1, cv2.LINE_AA)
+        n = len(self.latest_detections)
+        status = f"TARGET LOCKED [{n}]" if n > 0 else "SCANNING..."
+        status_color = COLOR_TARGET if n > 0 else COLOR_HUD
+        cv2.putText(img, status, (w - 160, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, status_color, 1, cv2.LINE_AA)
         
-        # Statut à droite
-        status = "SCAN..."
-        if self.latest_detections:
-            status = "TARGET LOCKED"
-        status_color = COLOR_TARGET if self.latest_detections else COLOR_HUD
-        cv2.putText(img, status, (w - 120, 17), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, status_color, 1, cv2.LINE_AA)
-        
-        # Ligne de balayage (scanline) animée
-        self.scan_line_y = (self.scan_line_y + 5) % h
-        cv2.line(img, (0, self.scan_line_y), (w, self.scan_line_y), COLOR_HUD, 1)
-        
-        # Bords du HUD
         cv2.rectangle(img, (1, 1), (w-2, h-2), COLOR_HUD, 1)
 
     def display_loop(self):
-        if not self.running:
-            return
+        if not self.running: return
         
         try:
             frame = self.frame_queue.get_nowait()
@@ -282,23 +366,14 @@ class MilitaryHUD:
             return
         
         display_frame = cv2.resize(frame, (self.hud_width, self.hud_height))
-        
         orig_h, orig_w = frame.shape[0], frame.shape[1]
-        scale_x = self.hud_width / orig_w
-        scale_y = self.hud_height / orig_h
+        scale_x, scale_y = self.hud_width / orig_w, self.hud_height / orig_h
         
-        # Dessiner les rectangles de visée
-        for (top, right, bottom, left, name, color) in self.latest_detections:
-            top_d = int(top * scale_y)
-            bottom_d = int(bottom * scale_y)
-            left_d = int(left * scale_x)
-            right_d = int(right * scale_x)
-            self.draw_military_box(display_frame, left_d, top_d, right_d, bottom_d, color, name)
+        for (top, right, bottom, left, name, color, target_id, distance) in self.latest_detections:
+            self.draw_military_box(display_frame, int(left*scale_x), int(top*scale_y), int(right*scale_x), int(bottom*scale_y), color, name, target_id, distance)
         
-        # Dessiner l'overlay HUD
         self.draw_hud_overlay(display_frame)
         
-        # Convertir et afficher
         img_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         img_tk = ImageTk.PhotoImage(image=img_pil)
@@ -313,25 +388,33 @@ class MilitaryHUD:
         self.root.destroy()
 
 # ============================================================
-# 6. POINT D'ENTRÉE
+# 7. POINT D'ENTRÉE
 # ============================================================
 def main():
-    print("[INFO] Chargement de la base de données...")
-    known_encodings, known_names = load_known_faces()
-    if not known_encodings:
-        print("[ERREUR] Aucun visage connu.")
-        return
-
-    print("[INFO] Initialisation du HUD MILITAIRE...")
-    print("[INFO] Cliquez-glissez pour déplacer. Molette pour redimensionner. Echap pour quitter.")
+    print("=== DEMARRAGE DU SYSTEME (MODE FAISS) ===")
     
+    face_db = FaceDatabase()
+    face_db.load_index()
+    
+    # Si l'index est vide, on le construit
+    if face_db.index is None or face_db.index.ntotal == 0:
+        print("[DB] Index vide ou inexistant. Veuillez lancer 'python build_index.py' d'abord.")
+        return
+    
+    face_db.start_watcher()
+    
+    print("[HUD] Création de la fenêtre Tkinter...")
     root = tk.Tk()
-    overlay = MilitaryHUD(root, known_encodings, known_names)
+    overlay = MilitaryHUD(root, face_db)
     
     root.bind("<Escape>", lambda e: overlay.close())
+    
     try:
+        print("[HUD] Fenêtre ouverte. En attente de la fermeture (Echap)...")
         root.mainloop()
     except KeyboardInterrupt:
+        print("\n[INFO] Arrêt demandé par l'utilisateur.")
+        face_db.running = False
         overlay.close()
 
 if __name__ == "__main__":
