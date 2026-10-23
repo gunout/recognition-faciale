@@ -1,3 +1,5 @@
+<div align="center">
+
 # 🎯 Recognition Faciale
 
 > Détection et reconnaissance faciale en temps réel sur flux vidéo, avec interface HUD flottante, snapshots d'inconnus et recherche vectorielle rapide (FAISS).
@@ -8,6 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python)](https://www.python.org/)
 [![FAISS](https://img.shields.io/badge/FAISS-Enabled-orange?style=for-the-badge)](https://github.com/facebookresearch/faiss)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+</div>
 
 ---
 
