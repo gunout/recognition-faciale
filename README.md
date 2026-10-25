@@ -120,7 +120,7 @@ Options : `--dry-run` · `-v` · `--verify-only`
 
 ### 3. Lancer la surveillance
 
-    python reco.py
+    python recognition.py
 
 ### 4. Utiliser le HUD
 
