@@ -57,7 +57,7 @@ Ce projet est conçu en **Privacy by Design**. Aucune image, aucun flux vidéo, 
 ---
 
 ## 🏗️ Architecture
-
+```text
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │  ScreenCapture  │───▶│ DetectionService │───▶│  MilitaryHUD    │
 │  (thread #1)    │    │  (thread #2)     │    │  (Tk mainloop)  │
@@ -75,7 +75,7 @@ Ce projet est conçu en **Privacy by Design**. Aucune image, aucun flux vidéo, 
                        │  (clustering +    │
                        │   cooldown)       │
                        └───────────────────┘
-
+```
 **Points clés** : 3 threads + 1 mainloop Tk · 2 queues bornées à 1 · 2 verrous (`dlib_lock`, `FaceDatabase.lock`)
 
 ---
